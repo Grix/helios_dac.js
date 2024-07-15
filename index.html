@@ -13,13 +13,411 @@
             <div id="devicesList"></div>
 		</div>
 		<script type="module">           
-            import * as Helios from './helios_dac.js';
+            
+			const HELIOS_SDK_VERSION = 6;
+
+			const HELIOS_MAX_POINTS = 0x1000;
+			const HELIOS_MAX_RATE = 0xFFFF;
+			const HELIOS_MIN_RATE = 7;
+
+			const HELIOS_SUCCESS = 1;
+			const HELIOS_ERROR = -1;
+
+			export const HELIOS_FLAGS_DEFAULT = 0;
+			export const HELIOS_FLAGS_START_IMMEDIATELY = (1 << 0);
+			export const HELIOS_FLAGS_SINGLE_MODE = (1 << 1);
+			export const HELIOS_FLAGS_DONT_BLOCK = (1 << 2);
+
+			// USB properties
+			export const HELIOS_VID = 0x1209;
+			export const HELIOS_PID = 0xE500;
+
+			const EP_BULK_OUT = 0x02;
+			const EP_BULK_IN = 0x81;
+			const EP_INT_OUT = 0x06;
+			const EP_INT_IN = 0x83;
+
+			// Point data structure
+			export class HeliosPoint {
+				constructor(x = 0, y = 0, r = 0, g = 0, b = 0, i = 0) {
+					this.x = x;
+					this.y = y;
+					this.r = r;
+					this.g = g;
+					this.b = b;
+					this.i = i;
+				}
+			}
+
+			export class HeliosDacManager {
+				constructor() {
+					this.initialized = false;
+					this.deviceList = [];
+				}
+
+				async openDevices() {
+					if (this.initialized) return this.deviceList.length;
+
+					this.deviceList = [];
+					try {
+						let devices = await navigator.usb.getDevices();
+						for (const device of devices) {
+							if (device.vendorId === HELIOS_VID && device.productId === HELIOS_PID) {
+								await device.open();
+								await device.selectConfiguration(1);
+								await device.claimInterface(0);
+								await device.selectAlternateInterface(0,1);
+								this.deviceList.push(new HeliosDacDevice(device));
+							}
+						}
+						this.initialized = true;
+						return this.deviceList.length;
+					} catch (error) {
+						console.error('Error opening devices:', error);
+						return -1;
+					}
+				}
+
+				async closeDevices() {
+					if (!this.initialized) return HELIOS_ERROR;
+
+					this.initialized = false;
+					for (const device of this.deviceList) {
+						await device.close();
+					}
+					this.deviceList = [];
+					return HELIOS_SUCCESS;
+				}
+
+				async writeFrame(devNum, pps, flags, points, numOfPoints) {
+					if (!this.initialized) return HELIOS_ERROR;
+					if (!points || numOfPoints > HELIOS_MAX_POINTS || pps > HELIOS_MAX_RATE || pps < HELIOS_MIN_RATE) return HELIOS_ERROR;
+
+					const device = this.deviceList[devNum];
+					if (!device) return HELIOS_ERROR;
+
+					return await device.sendFrame(pps, flags, points, numOfPoints);
+				}
+
+				async getStatus(devNum) {
+					if (!this.initialized) return HELIOS_ERROR;
+
+					const device = this.deviceList[devNum];
+					if (!device) return HELIOS_ERROR;
+
+					return await device.getStatus();
+				}
+
+				async getFirmwareVersion(devNum) {
+					if (!this.initialized) return HELIOS_ERROR;
+
+					const device = this.deviceList[devNum];
+					if (!device) return HELIOS_ERROR;
+
+					return await device.getFirmwareVersion();
+				}
+
+				async getName(devNum) {
+					if (!this.initialized) return HELIOS_ERROR;
+
+					const device = this.deviceList[devNum];
+					if (!device) return HELIOS_ERROR;
+
+					return await device.getName();
+				}
+
+				async setName(devNum, name) {
+					if (!this.initialized) return HELIOS_ERROR;
+
+					const device = this.deviceList[devNum];
+					if (!device) return HELIOS_ERROR;
+
+					return await device.setName(name);
+				}
+
+				async stop(devNum) {
+					if (!this.initialized) return HELIOS_ERROR;
+
+					const device = this.deviceList[devNum];
+					if (!device) return HELIOS_ERROR;
+
+					return await device.stop();
+				}
+
+				async setShutter(devNum, level) {
+					if (!this.initialized) return HELIOS_ERROR;
+
+					const device = this.deviceList[devNum];
+					if (!device) return HELIOS_ERROR;
+
+					return await device.setShutter(level);
+				}
+
+				async eraseFirmware(devNum) {
+					if (!this.initialized) return HELIOS_ERROR;
+
+					const device = this.deviceList[devNum];
+					if (!device) return HELIOS_ERROR;
+
+					return await device.eraseFirmware();
+				}
+			}
+
+			export class HeliosDacDevice {
+				constructor(device) {
+					this.device = device;
+					this.frameReady = false;
+					this.closed = true;
+					this.frameBuffer = new ArrayBuffer(HELIOS_MAX_POINTS * 7 + 5);
+					this.init();
+				}
+
+				async init() {
+					//await this.getFirmwareVersion();
+					this.closed = false;
+					this.frameHandler();
+				}
+
+				async sendFrame(pps, flags, points, numOfPoints) {
+					if (this.closed || this.frameReady) return HELIOS_ERROR;
+
+					let bufPos = 0;
+					const _frameBuffer = new Uint8Array(numOfPoints * 7 + 5);
+
+					for (let i = 0; i < numOfPoints; i++) {
+						_frameBuffer[bufPos++] = points[i].x >> 4;
+						_frameBuffer[bufPos++] = ((points[i].x & 0x0F) << 4) | (points[i].y >> 8);
+						_frameBuffer[bufPos++] = points[i].y & 0xFF;
+						_frameBuffer[bufPos++] = points[i].r;
+						_frameBuffer[bufPos++] = points[i].g;
+						_frameBuffer[bufPos++] = points[i].b;
+						_frameBuffer[bufPos++] = points[i].i;
+					}
+					_frameBuffer[bufPos++] = pps & 0xFF;
+					_frameBuffer[bufPos++] = pps >> 8;
+					_frameBuffer[bufPos++] = numOfPoints & 0xFF;
+					_frameBuffer[bufPos++] = numOfPoints >> 8;
+					_frameBuffer[bufPos++] = flags;
+
+					if (flags & HELIOS_FLAGS_DONT_BLOCK) {
+						this.frameReady = true;
+						return HELIOS_SUCCESS;
+					} else {
+						return await this.doFrame(_frameBuffer);
+					}
+				}
+
+				async doFrame(_frameBuffer) {
+					if (this.closed) return HELIOS_ERROR;
+
+					try {
+						await this.device.transferOut(2, _frameBuffer);
+						return HELIOS_SUCCESS;
+					} catch (error) {
+						console.error('Error sending frame:', error);
+						return HELIOS_ERROR;
+					}
+				}
+
+				async frameHandler() {
+					while (!this.closed) {
+						if (this.frameReady) {
+							await this.doFrame();
+							this.frameReady = false;
+						}
+						await new Promise(resolve => setTimeout(resolve, 100));
+					}
+				}
+
+				async getFirmwareVersion() {
+					if (this.closed) return HELIOS_ERROR;
+
+					try {
+						const result = await this.device.TransferIn(5, 0);
+
+						if (result.data && result.data.getUint8(0) === 0x84) {
+							this.firmwareVersion = result.data.getUint32(1, true);
+							return this.firmwareVersion;
+						}
+						return HELIOS_ERROR;
+					} catch (error) {
+						console.error('Error getting firmware version:', error);
+						return HELIOS_ERROR;
+					}
+				}
+
+				async getName() {
+					if (this.closed) return HELIOS_ERROR;
+
+					try {
+						const result = await this.device.controlTransferIn({
+							requestType: 'vendor',
+							recipient: 'device',
+							request: 0x05,
+							value: 0x00,
+							index: 0x00
+						}, 32);
+
+						if (result.data && result.data.getUint8(0) === 0x85) {
+							const name = new TextDecoder().decode(result.data.buffer.slice(1));
+							return name;
+						}
+						return HELIOS_ERROR;
+					} catch (error) {
+						console.error('Error getting name:', error);
+						return HELIOS_ERROR;
+					}
+				}
+
+				async setName(name) {
+					if (this.closed) return HELIOS_ERROR;
+
+					try {
+						const nameArray = new TextEncoder().encode(name);
+						await this.device.controlTransferOut({
+							requestType: 'vendor',
+							recipient: 'device',
+							request: 0x06,
+							value: 0x00,
+							index: 0x00
+						}, nameArray);
+
+						return HELIOS_SUCCESS;
+					} catch (error) {
+						console.error('Error setting name:', error);
+						return HELIOS_ERROR;
+					}
+				}
+
+				async getStatus1() {
+					if (this.closed) return HELIOS_ERROR;
+
+					try {
+						const result = await this.device.controlTransferIn({
+							requestType: 'vendor',
+							recipient: 'device',
+							request: EP_STATUS_IN,
+							value: 0x00,
+							index: 0x00
+						}, 2);
+
+						if (result.data && result.data.getUint8(0) === 0x83) {
+							return result.data.getUint8(1) === 0 ? 0 : 1;
+						}
+						return HELIOS_ERROR;
+					} catch (error) {
+						console.error('Error getting status:', error);
+						return HELIOS_ERROR;
+					}
+				}
+
+				async getStatus() {
+					if (this.closed) return HELIOS_ERROR;
+
+					try {
+						
+						const buffer = new Uint8Array(2);
+						buffer[0] = 3;
+						buffer[1] = 0;
+						await this.device.transferOut(6, buffer);
+						
+						const result = await this.device.transferIn(3, 2);
+						if (result.data && result.data.getUint8(0) === 0x83) {
+							return result.data.getUint8(1) === 0 ? 0 : 1;
+						}
+						
+						/*
+						this.device.transferIn(3, 2).then((result)=>{
+							if (result.data && result.data.getUint8(0) === 0x83) {
+								return result.data.getUint8(1) === 0 ? 0 : 1;
+							}
+							return HELIOS_ERROR;
+						});
+						*/
+
+						return HELIOS_ERROR;
+					} catch (error) {
+						console.error('Error getting status:', error);
+						return HELIOS_ERROR;
+					}
+				}
+
+				async setShutter(level) {
+					if (this.closed) return HELIOS_ERROR;
+
+					try {
+						await this.device.controlTransferOut({
+							requestType: 'vendor',
+							recipient: 'device',
+							request: 0x02,
+							value: level ? 1 : 0,
+							index: 0x00
+						});
+
+						return HELIOS_SUCCESS;
+					} catch (error) {
+						console.error('Error setting shutter:', error);
+						return HELIOS_ERROR;
+					}
+				}
+
+				async stop() {
+					if (this.closed) return HELIOS_ERROR;
+
+					try {
+						const result = await this.device.transferIn(1, 2);
+						if (result == HELIOS_SUCCESS){
+							await new Promise(resolve => setTimeout(resolve, 100));
+							return HELIOS_SUCCESS;
+						} else {
+							return HELIOS_ERROR;
+						}
+					} catch (error) {
+						console.error('Error stopping device:', error);
+						return HELIOS_ERROR;
+					}
+				}
+
+				async eraseFirmware() {
+					if (this.closed) return HELIOS_ERROR;
+
+					try {
+						await this.device.controlTransferOut({
+							requestType: 'vendor',
+							recipient: 'device',
+							request: 0x07,
+							value: 0x00,
+							index: 0x00
+						});
+
+						return HELIOS_SUCCESS;
+					} catch (error) {
+						console.error('Error erasing firmware:', error);
+						return HELIOS_ERROR;
+					}
+				}
+
+				async close() {
+					if (this.closed) return;
+
+					try {
+						await this.stop();
+						await this.device.close();
+						this.closed = true;
+					} catch (error) {
+						console.error('Error closing device:', error);
+					}
+				}
+			}
+			
+			
+			
 
 			const NUM_FRAMES = 30;
 			const POINTS_PER_FRAME = 1000;
 			const MAX_CYCLES = 150;
 			const PPS = 30000;
-			const FLAGS = Helios.HELIOS_FLAGS_DEFAULT;
+			const FLAGS = HELIOS_FLAGS_DEFAULT;
 			const WAIT_LIMIT = 512;
 
 			let devicesListElm;
@@ -35,11 +433,11 @@
 				connectBtn = document.getElementById('connectBtn');
 				disconnectBtn = document.getElementById('disconnectBtn');
 				stopBtn = document.getElementById('stopBtn');
-				heliosDacManager = new Helios.HeliosDacManager();
+				heliosDacManager = new HeliosDacManager();
 				window.heliosDacManager = heliosDacManager;
 				connectBtn.addEventListener('click', async () => {
 					try{
-						let device = await navigator.usb.requestDevice({ filters: [{vendorId: Helios.HELIOS_VID, classCode: Helios.HELIOS_PID}]});
+						let device = await navigator.usb.requestDevice({ filters: [{vendorId: HELIOS_VID, classCode: HELIOS_PID}]});
 						const numDevs = await heliosDacManager.openDevices();
 						if (numDevs == 0){
 							return;
@@ -101,7 +499,7 @@
 						} else {
 							x = 0xFFF - Math.floor((j - POINTS_PER_FRAME / 2) * 0xFFF / (POINTS_PER_FRAME / 2));
 						}
-						frame.push(new Helios.HeliosPoint(x, y, 0xD0, 0xFF, 0xD0, 0xFF));
+						frame.push(new HeliosPoint(x, y, 0xD0, 0xFF, 0xD0, 0xFF));
 					}
 					frames.push(frame);
 				}
@@ -124,14 +522,15 @@
 						let intensity = (j==POINTS_PER_FRAME)? 0: 255;
 						if (odd){  //  odd lines
 							let x = Math.floor(j * pointFactor);
-							const point = new Helios.HeliosPoint(x, y, 208, 255, 208, intensity);
+							const point = new HeliosPoint(x, y, 208, 255, 208, intensity);
 							frame.push(point);
 						} else {  // even lines
 							let x = range - Math.floor(j * pointFactor);
-							const point = new Helios.HeliosPoint(x, y, 208, 255, 208, intensity);
+							const point = new HeliosPoint(x, y, 208, 255, 208, intensity);
 							frame.push(point);
 						}
 					}
+					frames.push(frame);
 				}
 				return frames;
 			}
@@ -139,6 +538,7 @@
 			async function waitForReadyStatus(devNum) {
 				//for (let k = 0; k < WAIT_LIMIT; k++) {
 					let result = await heliosDacManager.getStatus(devNum);
+					console.log("Status get: "+result);
 					if (result === 1) {
 						return true;
 					}
@@ -148,6 +548,8 @@
 
 			async function sendFrames(numDevs) {
 				let cycleCount = 0;
+				const frames = await createFrames();
+				
 				while (cycleCount < MAX_CYCLES) {
 					cycleCount++;
 					console.log(cycleCount);
@@ -168,7 +570,6 @@
 
 			async function main() {
 				try {
-					const frames = await createFrames();
 					await sendFrames(heliosDacManager.deviceList.length);
 				} catch (error) {
 					console.log("An error occurred:", error);
